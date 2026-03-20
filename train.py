@@ -141,6 +141,63 @@ def compute_installment_features(train_df, test_df):
     return result
 
 
+def compute_pos_cash_features(train_df, test_df):
+    """Aggregate features from historical_pos_cash_monthly."""
+    pos = load_auxiliary("historical_pos_cash_monthly.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    agg = pos.groupby(ID_COL).agg({
+        "months_relative": ["count", "max", "min"],
+        "count_installment": ["mean", "max"],
+        "count_installment_future": ["mean", "min"],
+        "days_past_due": ["mean", "max", "sum"],
+        "days_past_due_tolerance": ["mean", "max", "sum"],
+    })
+    agg.columns = ["pos_" + "_".join(c) for c in agg.columns]
+
+    # DPD flags
+    pos_dpd = pos[pos["days_past_due"] > 0].groupby(ID_COL).size().rename("pos_dpd_count")
+    # Contract status counts
+    status = pos.groupby([ID_COL, "category_contract_status"]).size().unstack(fill_value=0)
+    status.columns = ["pos_status_" + str(c) for c in status.columns]
+
+    features = agg.join(pos_dpd).join(status)
+    features["pos_dpd_count"] = features["pos_dpd_count"].fillna(0)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
+def compute_card_features(train_df, test_df):
+    """Aggregate features from historical_card_monthly."""
+    card = load_auxiliary("historical_card_monthly.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    card["utilization"] = card["amount_balance"] / card["amount_credit_limit_actual"].replace(0, np.nan)
+
+    agg = card.groupby(ID_COL).agg({
+        "months_relative": ["count", "max", "min"],
+        "amount_balance": ["mean", "max", "min"],
+        "amount_credit_limit_actual": ["mean", "max"],
+        "amount_drawings_atm_current": ["mean", "max", "sum"],
+        "amount_drawings_current": ["mean", "max", "sum"],
+        "amount_payment_current": ["mean", "max", "sum"],
+        "amount_payment_total_current": ["mean", "sum"],
+        "amount_receivable_principal": ["mean", "max"],
+        "amount_total_receivable": ["mean", "max"],
+        "count_drawings_atm_current": ["mean", "sum"],
+        "count_drawings_current": ["mean", "sum"],
+        "count_installment_mature_cum": ["max"],
+        "days_past_due": ["mean", "max", "sum"],
+        "days_past_due_tolerance": ["mean", "max"],
+        "utilization": ["mean", "max", "min"],
+    })
+    agg.columns = ["card_" + "_".join(c) for c in agg.columns]
+
+    result = all_ids.merge(agg, on=ID_COL, how="left")
+    return result
+
+
 def build_features(train_df, test_df):
     """Build features. Returns (X, y, X_test, test_ids)."""
     y = train_df[TARGET_COL]
@@ -171,6 +228,20 @@ def build_features(train_df, test_df):
     inst_test = inst_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X, inst_train], axis=1)
     X_test = pd.concat([X_test, inst_test], axis=1)
+
+    # POS cash features
+    pos_feats = get_or_compute_features(compute_pos_cash_features, train_df, test_df)
+    pos_train = pos_feats.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    pos_test = pos_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, pos_train], axis=1)
+    X_test = pd.concat([X_test, pos_test], axis=1)
+
+    # Card monthly features
+    card_feats = get_or_compute_features(compute_card_features, train_df, test_df)
+    card_train = card_feats.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    card_test = card_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, card_train], axis=1)
+    X_test = pd.concat([X_test, card_test], axis=1)
 
     # Label-encode categorical columns
     cat_cols = X.select_dtypes(include=["object", "string"]).columns.tolist()
