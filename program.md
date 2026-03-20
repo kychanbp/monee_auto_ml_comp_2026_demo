@@ -123,7 +123,7 @@ commit,val_auc,val_auc_std,n_features,status,description,submission_file
 
 ## Research
 
-When brainstorming ideas, use web search to find relevant techniques, papers, and domain knowledge for credit risk modeling.
+When brainstorming ideas, use web search to find relevant techniques, papers, and domain knowledge for credit risk modeling. You may also use external LLM tools (e.g. Codex CLI) for brainstorming and generating ideas.
 
 ## Parallelism
 
