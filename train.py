@@ -107,6 +107,40 @@ def compute_prev_app_features(train_df, test_df):
     return result
 
 
+def compute_installment_features(train_df, test_df):
+    """Aggregate features from historical_installment_payments."""
+    inst = load_auxiliary("historical_installment_payments.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    # Payment delay: days_entry_payment - days_installment (positive = late)
+    inst["payment_delay"] = inst["days_entry_payment"] - inst["days_installment"]
+    # Payment difference: amount_payment - amount_installment (negative = underpaid)
+    inst["payment_diff"] = inst["amount_payment"] - inst["amount_installment"]
+    inst["payment_ratio"] = inst["amount_payment"] / inst["amount_installment"].replace(0, np.nan)
+    inst["is_late"] = (inst["payment_delay"] > 0).astype(int)
+    inst["is_underpaid"] = (inst["payment_diff"] < -1).astype(int)
+
+    agg = inst.groupby(ID_COL).agg({
+        "payment_delay": ["mean", "max", "min", "std", "sum"],
+        "payment_diff": ["mean", "max", "min", "sum"],
+        "payment_ratio": ["mean", "min"],
+        "is_late": ["sum", "mean"],
+        "is_underpaid": ["sum", "mean"],
+        "amount_installment": ["mean", "max", "sum"],
+        "amount_payment": ["mean", "max", "sum"],
+        "number_installment_number": ["max"],
+        "days_installment": ["min", "max"],
+    })
+    agg.columns = ["inst_" + "_".join(c) for c in agg.columns]
+
+    # Count of installment records
+    cnt = inst.groupby(ID_COL).size().rename("inst_count")
+    features = agg.join(cnt)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
 def build_features(train_df, test_df):
     """Build features. Returns (X, y, X_test, test_ids)."""
     y = train_df[TARGET_COL]
@@ -130,6 +164,13 @@ def build_features(train_df, test_df):
     prev_test = prev_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X, prev_train], axis=1)
     X_test = pd.concat([X_test, prev_test], axis=1)
+
+    # Installment payment features
+    inst_feats = get_or_compute_features(compute_installment_features, train_df, test_df)
+    inst_train = inst_feats.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    inst_test = inst_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, inst_train], axis=1)
+    X_test = pd.concat([X_test, inst_test], axis=1)
 
     # Label-encode categorical columns
     cat_cols = X.select_dtypes(include=["object", "string"]).columns.tolist()
