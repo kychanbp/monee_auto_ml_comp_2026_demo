@@ -243,6 +243,37 @@ def build_features(train_df, test_df):
     X = pd.concat([X, card_train], axis=1)
     X_test = pd.concat([X_test, card_test], axis=1)
 
+    # Domain-specific feature engineering on main table
+    for df in [X, X_test]:
+        # Financial ratios
+        df["credit_income_ratio"] = df["amount_credit"] / df["amount_income_annual"].replace(0, np.nan)
+        df["annuity_income_ratio"] = df["amount_annuity_payment"] / df["amount_income_annual"].replace(0, np.nan)
+        df["credit_goods_ratio"] = df["amount_credit"] / df["amount_goods_price"].replace(0, np.nan)
+        df["credit_annuity_ratio"] = df["amount_credit"] / df["amount_annuity_payment"].replace(0, np.nan)
+        df["goods_income_ratio"] = df["amount_goods_price"] / df["amount_income_annual"].replace(0, np.nan)
+        # Age-related
+        df["age_years"] = -df["days_since_birth"] / 365.25
+        df["employment_years"] = -df["days_since_employment_start"] / 365.25
+        df["employment_age_ratio"] = df["employment_years"] / df["age_years"].replace(0, np.nan)
+        # External source combinations
+        df["ext_source_mean"] = df[["external_source_1", "external_source_2", "external_source_3"]].mean(axis=1)
+        df["ext_source_prod"] = df["external_source_1"] * df["external_source_2"] * df["external_source_3"]
+        df["ext_source_std"] = df[["external_source_1", "external_source_2", "external_source_3"]].std(axis=1)
+        # Income per family member
+        df["income_per_family"] = df["amount_income_annual"] / df["count_family_members"].replace(0, np.nan)
+        df["income_per_child"] = df["amount_income_annual"] / (df["count_children"] + 1)
+        # Document count
+        doc_cols = [c for c in df.columns if c.startswith("has_document_")]
+        df["document_count"] = df[doc_cols].sum(axis=1)
+        # Phone/contact score
+        df["contact_score"] = (
+            df.get("has_mobile_phone", 0) + df.get("has_employer_phone", 0) +
+            df.get("has_home_phone_reported", 0) + df.get("has_email_reported", 0)
+        )
+        # Region mismatch score
+        mismatch_cols = [c for c in df.columns if "diff_from" in c]
+        df["region_mismatch_count"] = df[mismatch_cols].sum(axis=1)
+
     # Label-encode categorical columns
     cat_cols = X.select_dtypes(include=["object", "string"]).columns.tolist()
     for col in cat_cols:
