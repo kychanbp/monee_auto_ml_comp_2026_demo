@@ -248,6 +248,52 @@ def compute_installment_recent_features(train_df, test_df):
     return result
 
 
+def compute_pos_recent_features(train_df, test_df):
+    """Recent POS cash behavior (last 12 months)."""
+    pos = load_auxiliary("historical_pos_cash_monthly.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    recent = pos[pos["months_relative"] >= -12].copy()
+    recent["has_dpd"] = (recent["days_past_due"] > 0).astype(int)
+
+    agg = recent.groupby(ID_COL).agg({
+        "days_past_due": ["mean", "max", "sum"],
+        "has_dpd": ["sum", "mean"],
+        "count_installment_future": ["mean", "min"],
+    })
+    agg.columns = ["pos_recent_" + "_".join(c) for c in agg.columns]
+    cnt = recent.groupby(ID_COL).size().rename("pos_recent_count")
+    features = agg.join(cnt)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
+def compute_card_recent_features(train_df, test_df):
+    """Recent card behavior (last 12 months)."""
+    card = load_auxiliary("historical_card_monthly.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    recent = card[card["months_relative"] >= -12].copy()
+    recent["utilization"] = recent["amount_balance"] / recent["amount_credit_limit_actual"].replace(0, np.nan)
+    recent["has_dpd"] = (recent["days_past_due"] > 0).astype(int)
+
+    agg = recent.groupby(ID_COL).agg({
+        "utilization": ["mean", "max", "std"],
+        "amount_balance": ["mean", "max"],
+        "amount_payment_current": ["mean", "sum"],
+        "days_past_due": ["mean", "max"],
+        "has_dpd": ["sum", "mean"],
+        "amount_drawings_current": ["mean", "sum"],
+    })
+    agg.columns = ["card_recent_" + "_".join(c) for c in agg.columns]
+    cnt = recent.groupby(ID_COL).size().rename("card_recent_count")
+    features = agg.join(cnt)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
 def compute_pos_cash_features(train_df, test_df):
     """Aggregate features from historical_pos_cash_monthly."""
     pos = load_auxiliary("historical_pos_cash_monthly.parquet")
@@ -370,6 +416,20 @@ def build_features(train_df, test_df):
     card_test = card_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X, card_train], axis=1)
     X_test = pd.concat([X_test, card_test], axis=1)
+
+    # Recent POS cash features
+    pos_recent = get_or_compute_features(compute_pos_recent_features, train_df, test_df)
+    pos_recent_train = pos_recent.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    pos_recent_test = pos_recent.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, pos_recent_train], axis=1)
+    X_test = pd.concat([X_test, pos_recent_test], axis=1)
+
+    # Recent card features
+    card_recent = get_or_compute_features(compute_card_recent_features, train_df, test_df)
+    card_recent_train = card_recent.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    card_recent_test = card_recent.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, card_recent_train], axis=1)
+    X_test = pd.concat([X_test, card_recent_test], axis=1)
 
     # Domain-specific feature engineering on main table
     for df in [X, X_test]:
