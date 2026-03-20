@@ -105,8 +105,9 @@ LOOP FOREVER:
 2. **No data leakage** — never use validation/test labels during training
 3. **Simplicity criterion** — a tiny AUC gain that adds massive complexity is not worth keeping. Deletions that maintain performance are valued.
 4. **Timeout** — if `python train.py` produces no result for 12 hours, kill and discard. For shorter runs, use your judgement on whether the experiment is making progress and decide whether to keep waiting or kill early.
-5. **One idea per experiment** — isolate changes so you know what worked
-6. **Read run.log, not stdout** — redirect output to avoid flooding context
+5. **Time budget** — you have ~14 days total. Budget for 50-100+ experiments.
+6. **One idea per experiment** — isolate changes so you know what worked
+7. **Read run.log, not stdout** — redirect output to avoid flooding context
 
 ### Logging Format (results.csv)
 

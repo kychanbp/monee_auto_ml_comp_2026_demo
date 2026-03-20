@@ -81,6 +81,23 @@ grep "keep" results.csv
 cat notes.md
 ```
 
+### Remote Monitoring
+
+You can monitor the agent remotely using Claude Code's resume feature:
+
+```bash
+# List active sessions
+claude --list
+
+# Resume and observe a running session from another terminal
+claude --resume <session-id>
+
+# Continue the most recent session
+claude --continue
+```
+
+This lets you check on the agent's progress from any terminal without interrupting it.
+
 ## Key Design Decisions
 
 | Decision | Rationale |
