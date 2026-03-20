@@ -42,6 +42,7 @@ An autonomous ML experiment where an LLM agent iteratively improves a credit ris
 
 - Python 3.11+
 - [Claude Code](https://claude.ai/claude-code) CLI
+- (Optional) [Codex CLI](https://github.com/openai/codex) — for additional brainstorming
 
 ### Option A: Dev Container (recommended)
 
