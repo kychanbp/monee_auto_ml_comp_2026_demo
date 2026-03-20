@@ -7,6 +7,7 @@ import time
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
 from prepare import (
     load_train, load_test, evaluate, generate_submission,
@@ -361,8 +362,9 @@ def build_features(train_df, test_df):
 
 
 def train_fn(X_train, y_train, X_val, X_test):
-    """Train a model. Returns (val_preds, test_preds)."""
-    params = {
+    """Train LightGBM + XGBoost blend. Returns (val_preds, test_preds)."""
+    # LightGBM
+    lgb_params = {
         "objective": "binary",
         "metric": "auc",
         "boosting_type": "gbdt",
@@ -380,18 +382,37 @@ def train_fn(X_train, y_train, X_val, X_test):
         "seed": 42,
         "n_jobs": -1,
     }
-
     dtrain = lgb.Dataset(X_train, label=y_train)
-
-    model = lgb.train(
-        params,
-        dtrain,
-        num_boost_round=2000,
+    lgb_model = lgb.train(
+        lgb_params, dtrain, num_boost_round=2000,
         callbacks=[lgb.log_evaluation(period=0)],
     )
+    lgb_val = lgb_model.predict(X_val)
+    lgb_test = lgb_model.predict(X_test)
 
-    val_preds = model.predict(X_val)
-    test_preds = model.predict(X_test)
+    # XGBoost
+    xgb_params = {
+        "objective": "binary:logistic",
+        "eval_metric": "auc",
+        "learning_rate": 0.02,
+        "max_depth": 6,
+        "min_child_weight": 30,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "seed": 42,
+        "nthread": -1,
+        "verbosity": 0,
+    }
+    dxtr = xgb.DMatrix(X_train, label=y_train)
+    xgb_model = xgb.train(xgb_params, dxtr, num_boost_round=2000)
+    xgb_val = xgb_model.predict(xgb.DMatrix(X_val))
+    xgb_test = xgb_model.predict(xgb.DMatrix(X_test))
+
+    # Blend 70/30 favoring LightGBM
+    val_preds = 0.7 * lgb_val + 0.3 * xgb_val
+    test_preds = 0.7 * lgb_test + 0.3 * xgb_test
 
     return val_preds, test_preds
 
