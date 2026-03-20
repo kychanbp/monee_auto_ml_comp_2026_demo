@@ -141,6 +141,66 @@ def compute_installment_features(train_df, test_df):
     return result
 
 
+def compute_bureau_active_features(train_df, test_df):
+    """Separate features for active vs closed bureau accounts."""
+    bureau = load_auxiliary("external_credit_registry.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    num_cols = ["amount_credit_sum", "amount_credit_sum_debt", "amount_credit_sum_overdue",
+                "amount_annuity_payment", "days_since_credit_opened", "days_credit_overdue"]
+
+    features_list = []
+    for status_val, prefix in [("Active", "bureau_active"), ("Closed", "bureau_closed")]:
+        subset = bureau[bureau["account_status"] == status_val]
+        if len(subset) == 0:
+            continue
+        agg = subset.groupby(ID_COL).agg({c: ["count", "mean", "sum"] for c in num_cols if c in subset.columns})
+        agg.columns = [f"{prefix}_{'_'.join(c)}" for c in agg.columns]
+        features_list.append(agg)
+
+    features = features_list[0] if features_list else pd.DataFrame(index=all_ids[ID_COL])
+    for f in features_list[1:]:
+        features = features.join(f, how="outer")
+
+    # Active credit load ratio
+    if "bureau_active_amount_credit_sum_sum" in features.columns:
+        features["bureau_active_debt_ratio"] = (
+            features.get("bureau_active_amount_credit_sum_debt_sum", 0) /
+            features["bureau_active_amount_credit_sum_sum"].replace(0, np.nan)
+        )
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
+def compute_installment_recent_features(train_df, test_df):
+    """Recent installment payment behavior (last 12 months only)."""
+    inst = load_auxiliary("historical_installment_payments.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    # Filter to recent installments (days_installment is negative, closer to 0 = more recent)
+    recent = inst[inst["days_installment"] > -365]
+    recent = recent.copy()
+    recent["payment_delay"] = recent["days_entry_payment"] - recent["days_installment"]
+    recent["payment_diff"] = recent["amount_payment"] - recent["amount_installment"]
+    recent["is_late"] = (recent["payment_delay"] > 0).astype(int)
+    recent["late_days"] = recent["payment_delay"].clip(lower=0)
+
+    agg = recent.groupby(ID_COL).agg({
+        "payment_delay": ["mean", "max", "std"],
+        "is_late": ["sum", "mean"],
+        "late_days": ["sum", "max"],
+        "payment_diff": ["mean", "min"],
+        "amount_payment": ["sum", "mean"],
+    })
+    agg.columns = ["inst_recent_" + "_".join(c) for c in agg.columns]
+    cnt = recent.groupby(ID_COL).size().rename("inst_recent_count")
+    features = agg.join(cnt)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
 def compute_pos_cash_features(train_df, test_df):
     """Aggregate features from historical_pos_cash_monthly."""
     pos = load_auxiliary("historical_pos_cash_monthly.parquet")
@@ -228,6 +288,20 @@ def build_features(train_df, test_df):
     inst_test = inst_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X, inst_train], axis=1)
     X_test = pd.concat([X_test, inst_test], axis=1)
+
+    # Bureau active/closed segmented features
+    bact_feats = get_or_compute_features(compute_bureau_active_features, train_df, test_df)
+    bact_train = bact_feats.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    bact_test = bact_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, bact_train], axis=1)
+    X_test = pd.concat([X_test, bact_test], axis=1)
+
+    # Recent installment features (last 12 months)
+    inst_recent = get_or_compute_features(compute_installment_recent_features, train_df, test_df)
+    inst_recent_train = inst_recent.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    inst_recent_test = inst_recent.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, inst_recent_train], axis=1)
+    X_test = pd.concat([X_test, inst_recent_test], axis=1)
 
     # POS cash features
     pos_feats = get_or_compute_features(compute_pos_cash_features, train_df, test_df)
