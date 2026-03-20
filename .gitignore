@@ -1,7 +1,11 @@
 results.csv
 notes.md
 run.log
-features/*.csv
-submissions/*.csv
+features/
+submissions/
+splits/
+logs/
+worktrees/
 __pycache__/
 *.pyc
+*.lockbox*
