@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import xgboost as xgb
+from catboost import CatBoostClassifier, Pool
 from sklearn.preprocessing import LabelEncoder
 from prepare import (
     load_train, load_test, evaluate, generate_submission,
@@ -410,9 +411,23 @@ def train_fn(X_train, y_train, X_val, X_test):
     xgb_val = xgb_model.predict(xgb.DMatrix(X_val))
     xgb_test = xgb_model.predict(xgb.DMatrix(X_test))
 
-    # Blend 70/30 favoring LightGBM
-    val_preds = 0.7 * lgb_val + 0.3 * xgb_val
-    test_preds = 0.7 * lgb_test + 0.3 * xgb_test
+    # CatBoost
+    cb_model = CatBoostClassifier(
+        iterations=2000,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=3.0,
+        random_seed=42,
+        verbose=0,
+        thread_count=-1,
+    )
+    cb_model.fit(X_train, y_train)
+    cb_val = cb_model.predict_proba(X_val)[:, 1]
+    cb_test = cb_model.predict_proba(X_test)[:, 1]
+
+    # Blend: 50% LGB + 25% XGB + 25% CatBoost
+    val_preds = 0.50 * lgb_val + 0.25 * xgb_val + 0.25 * cb_val
+    test_preds = 0.50 * lgb_test + 0.25 * xgb_test + 0.25 * cb_test
 
     return val_preds, test_preds
 
