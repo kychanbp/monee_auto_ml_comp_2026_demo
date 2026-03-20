@@ -84,20 +84,27 @@ cat notes.md
 
 ### Remote Monitoring
 
-You can monitor the agent remotely using Claude Code's resume feature:
+Use Claude Code's [Remote Control](https://docs.anthropic.com/en/docs/claude-code) to monitor the agent from any browser or the Claude mobile app.
 
+**Option 1: Start with remote control enabled**
 ```bash
-# List active sessions
-claude --list
-
-# Resume and observe a running session from another terminal
-claude --resume <session-id>
-
-# Continue the most recent session
-claude --continue
+claude --remote-control "Auto ML Experiment"
 ```
 
-This lets you check on the agent's progress from any terminal without interrupting it.
+**Option 2: Start a dedicated remote control server**
+```bash
+claude remote-control --name "Auto ML Experiment" --verbose
+```
+
+**Option 3: Enable mid-session**
+```
+/remote-control
+```
+
+Once enabled, connect via:
+- Open the session URL in any browser
+- Scan the QR code with the Claude mobile app
+- Find the session on [claude.ai/code](https://claude.ai/code)
 
 ## Experiment Progress
 
