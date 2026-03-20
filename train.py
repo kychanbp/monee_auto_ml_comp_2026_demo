@@ -109,6 +109,51 @@ def compute_prev_app_features(train_df, test_df):
     return result
 
 
+def compute_prev_app_enriched_features(train_df, test_df):
+    """Enriched historical application features — amount discrepancies, recency, rejection patterns."""
+    prev = load_auxiliary("historical_applications.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    # Amount discrepancy: how much credit differs from application
+    prev["credit_app_diff"] = prev["amount_credit"] - prev["amount_application"]
+    prev["credit_app_ratio"] = prev["amount_credit"] / prev["amount_application"].replace(0, np.nan)
+
+    # Most recent application (smallest days_decision = most recent)
+    most_recent = prev.sort_values("days_decision").groupby(ID_COL).first()
+    recent_cols = ["days_decision", "amount_credit", "amount_annuity_payment",
+                   "category_contract_status", "credit_app_diff"]
+    recent_feats = most_recent[recent_cols].copy()
+    recent_feats.columns = ["prev_recent_" + c for c in recent_cols]
+
+    # Approved-only stats
+    approved = prev[prev["category_contract_status"] == "Approved"]
+    approved_agg = approved.groupby(ID_COL).agg({
+        "amount_credit": ["mean", "sum"],
+        "days_decision": ["min", "max"],
+    })
+    approved_agg.columns = ["prev_approved_" + "_".join(c) for c in approved_agg.columns]
+
+    # Credit discrepancy stats
+    disc_agg = prev.groupby(ID_COL).agg({
+        "credit_app_diff": ["mean", "max", "min"],
+        "credit_app_ratio": ["mean", "min"],
+    })
+    disc_agg.columns = ["prev_" + "_".join(c) for c in disc_agg.columns]
+
+    # Yield group distribution
+    yield_counts = prev.groupby([ID_COL, "category_yield_group"]).size().unstack(fill_value=0)
+    yield_counts.columns = ["prev_yield_" + str(c) for c in yield_counts.columns]
+
+    features = recent_feats.join(approved_agg).join(disc_agg).join(yield_counts)
+
+    # Encode the recent contract status
+    if "prev_recent_category_contract_status" in features.columns:
+        features["prev_recent_category_contract_status"] = features["prev_recent_category_contract_status"].astype(str)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
 def compute_installment_features(train_df, test_df):
     """Aggregate features from historical_installment_payments."""
     inst = load_auxiliary("historical_installment_payments.parquet")
@@ -290,6 +335,13 @@ def build_features(train_df, test_df):
     inst_test = inst_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X, inst_train], axis=1)
     X_test = pd.concat([X_test, inst_test], axis=1)
+
+    # Enriched previous application features
+    prev_enr = get_or_compute_features(compute_prev_app_enriched_features, train_df, test_df)
+    prev_enr_train = prev_enr.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    prev_enr_test = prev_enr.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, prev_enr_train], axis=1)
+    X_test = pd.concat([X_test, prev_enr_test], axis=1)
 
     # Bureau active/closed segmented features
     bact_feats = get_or_compute_features(compute_bureau_active_features, train_df, test_df)
