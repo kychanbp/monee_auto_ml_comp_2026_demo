@@ -63,6 +63,50 @@ def compute_bureau_features(train_df, test_df):
     return result
 
 
+def compute_prev_app_features(train_df, test_df):
+    """Aggregate features from historical_applications."""
+    prev = load_auxiliary("historical_applications.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    # Numeric aggregations
+    num_aggs = {
+        "amount_annuity_payment": ["mean", "max", "sum"],
+        "amount_application": ["mean", "max", "min"],
+        "amount_credit": ["mean", "max", "sum"],
+        "amount_down_payment": ["mean", "max"],
+        "amount_goods_price": ["mean", "max"],
+        "days_decision": ["mean", "max", "min"],
+        "count_payment": ["mean", "max", "sum"],
+        "rate_down_payment": ["mean"],
+        "sellerplace_area": ["mean", "max"],
+        "hour_application_start": ["mean"],
+    }
+    agg = prev.groupby(ID_COL).agg(num_aggs)
+    agg.columns = ["prev_" + "_".join(c) for c in agg.columns]
+
+    # Count total prior apps
+    cnt = prev.groupby(ID_COL).size().rename("prev_app_count")
+
+    # Count by contract status (approved, refused, etc.)
+    status_counts = prev.groupby([ID_COL, "category_contract_status"]).size().unstack(fill_value=0)
+    status_counts.columns = ["prev_status_" + str(c) for c in status_counts.columns]
+
+    # Approval rate
+    features = agg.join(cnt).join(status_counts)
+    if "prev_status_Approved" in features.columns:
+        features["prev_approval_rate"] = (
+            features["prev_status_Approved"] / features["prev_app_count"].replace(0, np.nan)
+        )
+
+    # Count by contract type
+    type_counts = prev.groupby([ID_COL, "category_contract_type"]).size().unstack(fill_value=0)
+    type_counts.columns = ["prev_type_" + str(c) for c in type_counts.columns]
+    features = features.join(type_counts)
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
 def build_features(train_df, test_df):
     """Build features. Returns (X, y, X_test, test_ids)."""
     y = train_df[TARGET_COL]
@@ -79,6 +123,13 @@ def build_features(train_df, test_df):
     bureau_test = bureau_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X.reset_index(drop=True), bureau_train], axis=1)
     X_test = pd.concat([X_test.reset_index(drop=True), bureau_test], axis=1)
+
+    # Previous application features
+    prev_feats = get_or_compute_features(compute_prev_app_features, train_df, test_df)
+    prev_train = prev_feats.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    prev_test = prev_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, prev_train], axis=1)
+    X_test = pd.concat([X_test, prev_test], axis=1)
 
     # Label-encode categorical columns
     cat_cols = X.select_dtypes(include=["object", "string"]).columns.tolist()
