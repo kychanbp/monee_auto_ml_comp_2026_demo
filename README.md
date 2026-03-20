@@ -29,6 +29,7 @@ An autonomous ML experiment where an LLM agent iteratively improves a credit ris
 ├── .devcontainer/          # Dev container configuration
 │   ├── devcontainer.json
 │   └── Dockerfile
+├── analysis.py             # Generate progress chart from results.csv
 ├── results.csv             # Experiment results log (generated)
 ├── notes.md                # Experiment notes with code snippets (generated)
 └── submissions/            # All submission files (generated)
@@ -97,6 +98,17 @@ claude --continue
 ```
 
 This lets you check on the agent's progress from any terminal without interrupting it.
+
+## Experiment Progress
+
+![Experiment Progress](progress.png)
+
+The chart shows each experiment's OOF AUC score over time. Green dots are kept improvements, red dots are discarded experiments, and the step line tracks the best AUC frontier.
+
+Generate the chart:
+```bash
+python analysis.py
+```
 
 ## Key Design Decisions
 
