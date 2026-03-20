@@ -1,0 +1,7 @@
+results.csv
+notes.md
+run.log
+features/*.csv
+submissions/*.csv
+__pycache__/
+*.pyc
