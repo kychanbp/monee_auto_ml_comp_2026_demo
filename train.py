@@ -538,6 +538,37 @@ def build_features(train_df, test_df):
 
 def train_fn(X_train, y_train, X_val, X_test):
     """Train LightGBM + XGBoost blend. Returns (val_preds, test_preds)."""
+    from sklearn.neighbors import NearestNeighbors
+    from sklearn.impute import SimpleImputer
+
+    # KNN target mean features (computed within fold to avoid leakage)
+    knn_cols = ["ext_source_mean", "credit_annuity_ratio"]
+    knn_cols_avail = [c for c in knn_cols if c in X_train.columns]
+    if len(knn_cols_avail) >= 2:
+        imp = SimpleImputer(strategy="median")
+        X_knn_train = imp.fit_transform(X_train[knn_cols_avail])
+        X_knn_val = imp.transform(X_val[knn_cols_avail])
+        X_knn_test = imp.transform(X_test[knn_cols_avail])
+
+        k = 200
+        nn = NearestNeighbors(n_neighbors=k, algorithm="ball_tree", n_jobs=-1)
+        nn.fit(X_knn_train)
+        y_arr = y_train.values
+
+        _, val_idx = nn.kneighbors(X_knn_val)
+        X_val = X_val.copy()
+        X_val["knn_target_mean"] = np.array([y_arr[idx].mean() for idx in val_idx])
+
+        _, test_idx = nn.kneighbors(X_knn_test)
+        X_test = X_test.copy()
+        X_test["knn_target_mean"] = np.array([y_arr[idx].mean() for idx in test_idx])
+
+        nn_self = NearestNeighbors(n_neighbors=k+1, algorithm="ball_tree", n_jobs=-1)
+        nn_self.fit(X_knn_train)
+        _, train_idx = nn_self.kneighbors(X_knn_train)
+        X_train = X_train.copy()
+        X_train["knn_target_mean"] = np.array([y_arr[idx[1:]].mean() for idx in train_idx])
+
     # LightGBM
     lgb_params = {
         "objective": "binary",
