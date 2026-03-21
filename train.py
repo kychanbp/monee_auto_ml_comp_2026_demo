@@ -248,6 +248,47 @@ def compute_installment_recent_features(train_df, test_df):
     return result
 
 
+def compute_installment_multiwindow_features(train_df, test_df):
+    """Multi-window installment payment features (3mo, 6mo, 24mo)."""
+    inst = load_auxiliary("historical_installment_payments.parquet")
+    all_ids = pd.concat([train_df[[ID_COL]], test_df[[ID_COL]]])
+
+    inst = inst.copy()
+    inst["payment_delay"] = inst["days_entry_payment"] - inst["days_installment"]
+    inst["is_late"] = (inst["payment_delay"] > 0).astype(int)
+    inst["late_days"] = inst["payment_delay"].clip(lower=0)
+
+    all_features = []
+    for window_days, prefix in [(90, "inst_3m"), (180, "inst_6m"), (730, "inst_24m")]:
+        window = inst[inst["days_installment"] > -window_days]
+        agg = window.groupby(ID_COL).agg({
+            "payment_delay": ["mean", "max"],
+            "is_late": ["mean", "sum"],
+            "late_days": ["max"],
+        })
+        agg.columns = [f"{prefix}_{'_'.join(c)}" for c in agg.columns]
+        cnt = window.groupby(ID_COL).size().rename(f"{prefix}_count")
+        wf = agg.join(cnt)
+        all_features.append(wf)
+
+    features = all_features[0]
+    for f in all_features[1:]:
+        features = features.join(f, how="outer")
+
+    # Trend features: recent vs older behavior
+    if "inst_3m_is_late_mean" in features.columns and "inst_24m_is_late_mean" in features.columns:
+        features["inst_late_trend_3m_vs_24m"] = (
+            features["inst_3m_is_late_mean"] - features["inst_24m_is_late_mean"]
+        )
+    if "inst_6m_payment_delay_mean" in features.columns and "inst_24m_payment_delay_mean" in features.columns:
+        features["inst_delay_trend_6m_vs_24m"] = (
+            features["inst_6m_payment_delay_mean"] - features["inst_24m_payment_delay_mean"]
+        )
+
+    result = all_ids.merge(features, on=ID_COL, how="left")
+    return result
+
+
 def compute_pos_recent_features(train_df, test_df):
     """Recent POS cash behavior (last 12 months)."""
     pos = load_auxiliary("historical_pos_cash_monthly.parquet")
@@ -416,6 +457,13 @@ def build_features(train_df, test_df):
     card_test = card_feats.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
     X = pd.concat([X, card_train], axis=1)
     X_test = pd.concat([X_test, card_test], axis=1)
+
+    # Multi-window installment features
+    inst_mw = get_or_compute_features(compute_installment_multiwindow_features, train_df, test_df)
+    inst_mw_train = inst_mw.iloc[:n_train].drop(columns=[ID_COL]).reset_index(drop=True)
+    inst_mw_test = inst_mw.iloc[n_train:].drop(columns=[ID_COL]).reset_index(drop=True)
+    X = pd.concat([X, inst_mw_train], axis=1)
+    X_test = pd.concat([X_test, inst_mw_test], axis=1)
 
     # Recent POS cash features
     pos_recent = get_or_compute_features(compute_pos_recent_features, train_df, test_df)
