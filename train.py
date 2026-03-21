@@ -510,6 +510,20 @@ def build_features(train_df, test_df):
         mismatch_cols = [c for c in df.columns if "diff_from" in c]
         df["region_mismatch_count"] = df[mismatch_cols].sum(axis=1)
 
+    # Smoothed mean target encoding for high-cardinality categoricals
+    # Using global mean as prior with smoothing factor
+    global_mean = y.mean()
+    smooth_factor = 20  # regularization
+    high_card_cols = ["organization_type", "category_occupation_type"]
+    for col in high_card_cols:
+        if col in X.columns:
+            col_str = X[col].astype(str)
+            counts = col_str.value_counts()
+            target_means = pd.DataFrame({"col": col_str, "target": y.values}).groupby("col")["target"].agg(["mean", "count"])
+            smoothed = (target_means["count"] * target_means["mean"] + smooth_factor * global_mean) / (target_means["count"] + smooth_factor)
+            X[col + "_target_enc"] = col_str.map(smoothed).astype(float)
+            X_test[col + "_target_enc"] = X_test[col].astype(str).map(smoothed).fillna(global_mean).astype(float)
+
     # Label-encode categorical columns
     cat_cols = X.select_dtypes(include=["object", "string"]).columns.tolist()
     for col in cat_cols:
