@@ -569,32 +569,35 @@ def train_fn(X_train, y_train, X_val, X_test):
         X_train = X_train.copy()
         X_train["knn_target_mean"] = np.array([y_arr[idx[1:]].mean() for idx in train_idx])
 
-    # LightGBM
-    lgb_params = {
-        "objective": "binary",
-        "metric": "auc",
-        "boosting_type": "gbdt",
-        "learning_rate": 0.02,
-        "num_leaves": 63,
-        "max_depth": -1,
-        "min_child_samples": 30,
-        "feature_fraction": 0.7,
-        "bagging_fraction": 0.7,
-        "bagging_freq": 5,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "min_gain_to_split": 0.01,
-        "verbose": -1,
-        "seed": 42,
-        "n_jobs": -1,
+    # LightGBM model 1 — original deep config
+    lgb_params1 = {
+        "objective": "binary", "metric": "auc", "boosting_type": "gbdt",
+        "learning_rate": 0.02, "num_leaves": 63, "max_depth": -1,
+        "min_child_samples": 30, "feature_fraction": 0.7, "bagging_fraction": 0.7,
+        "bagging_freq": 5, "reg_alpha": 0.1, "reg_lambda": 1.0,
+        "min_gain_to_split": 0.01, "verbose": -1, "seed": 42, "n_jobs": -1,
     }
     dtrain = lgb.Dataset(X_train, label=y_train)
-    lgb_model = lgb.train(
-        lgb_params, dtrain, num_boost_round=2000,
-        callbacks=[lgb.log_evaluation(period=0)],
-    )
-    lgb_val = lgb_model.predict(X_val)
-    lgb_test = lgb_model.predict(X_test)
+    lgb1 = lgb.train(lgb_params1, dtrain, num_boost_round=2000,
+                     callbacks=[lgb.log_evaluation(period=0)])
+    lgb1_val = lgb1.predict(X_val)
+    lgb1_test = lgb1.predict(X_test)
+
+    # LightGBM model 2 — shallow config from top Kaggle solution (depth=5, feat_frac=0.3)
+    lgb_params2 = {
+        "objective": "binary", "metric": "auc", "boosting_type": "gbdt",
+        "learning_rate": 0.02, "max_depth": 5, "num_leaves": 31,
+        "min_child_samples": 50, "feature_fraction": 0.3, "bagging_fraction": 0.8,
+        "bagging_freq": 5, "reg_alpha": 0.5, "reg_lambda": 5.0,
+        "verbose": -1, "seed": 77, "n_jobs": -1,
+    }
+    lgb2 = lgb.train(lgb_params2, dtrain, num_boost_round=3000,
+                     callbacks=[lgb.log_evaluation(period=0)])
+    lgb2_val = lgb2.predict(X_val)
+    lgb2_test = lgb2.predict(X_test)
+
+    lgb_val = 0.6 * lgb1_val + 0.4 * lgb2_val
+    lgb_test = 0.6 * lgb1_test + 0.4 * lgb2_test
 
     # XGBoost
     xgb_params = {
