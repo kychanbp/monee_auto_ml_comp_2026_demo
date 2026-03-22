@@ -633,9 +633,54 @@ def train_fn(X_train, y_train, X_val, X_test):
     cb_val = cb_model.predict_proba(X_val)[:, 1]
     cb_test = cb_model.predict_proba(X_test)[:, 1]
 
-    # Blend: 50% LGB + 25% XGB + 25% CatBoost
-    val_preds = 0.50 * lgb_val + 0.25 * xgb_val + 0.25 * cb_val
-    test_preds = 0.50 * lgb_test + 0.25 * xgb_test + 0.25 * cb_test
+    # Level-2 stacking: train a meta-learner on base model predictions
+    # Use internal 3-fold CV on training data to generate OOF meta-features
+    from sklearn.model_selection import StratifiedKFold as SKF2
+    from sklearn.linear_model import LogisticRegression
+
+    base_val = np.column_stack([lgb1_val, lgb2_val, xgb_val, cb_val])
+    base_test = np.column_stack([lgb1_test, lgb2_test, xgb_test, cb_test])
+    base_train = np.column_stack([
+        lgb1.predict(X_train), lgb2.predict(X_train),
+        xgb_model.predict(xgb.DMatrix(X_train)),
+        cb_model.predict_proba(X_train)[:, 1],
+    ])
+
+    # Add key raw features for the stacker to use
+    key_feats = ["knn_target_mean", "ext_source_mean", "credit_annuity_ratio"]
+    key_avail = [c for c in key_feats if c in X_train.columns]
+    if key_avail:
+        imp_st = SimpleImputer(strategy="median")
+        kf_train = imp_st.fit_transform(X_train[key_avail])
+        kf_val = imp_st.transform(X_val[key_avail])
+        kf_test = imp_st.transform(X_test[key_avail])
+        meta_train = np.hstack([base_train, kf_train])
+        meta_val = np.hstack([base_val, kf_val])
+        meta_test = np.hstack([base_test, kf_test])
+    else:
+        meta_train = base_train
+        meta_val = base_val
+        meta_test = base_test
+
+    # Train OOF stacker to avoid overfitting
+    meta_oof = np.zeros(len(meta_train))
+    skf2 = SKF2(n_splits=3, shuffle=True, random_state=99)
+    for tr_idx, va_idx in skf2.split(meta_train, y_train):
+        lr = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+        lr.fit(meta_train[tr_idx], y_train.values[tr_idx])
+        meta_oof[va_idx] = lr.predict_proba(meta_train[va_idx])[:, 1]
+
+    # Final stacker trained on all training meta-features
+    lr_final = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+    lr_final.fit(meta_train, y_train)
+    stacker_val = lr_final.predict_proba(meta_val)[:, 1]
+    stacker_test = lr_final.predict_proba(meta_test)[:, 1]
+
+    # Blend base models (80%) + stacker (20%)
+    base_blend_val = 0.50 * (0.6*lgb1_val+0.4*lgb2_val) + 0.25 * xgb_val + 0.25 * cb_val
+    base_blend_test = 0.50 * (0.6*lgb1_test+0.4*lgb2_test) + 0.25 * xgb_test + 0.25 * cb_test
+    val_preds = 0.80 * base_blend_val + 0.20 * stacker_val
+    test_preds = 0.80 * base_blend_test + 0.20 * stacker_test
 
     return val_preds, test_preds
 
