@@ -12,9 +12,33 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.preprocessing import LabelEncoder
 from prepare import (
     load_train, load_test, evaluate, generate_submission,
-    split_lockbox, evaluate_lockbox, get_or_compute_features,
     load_auxiliary, TARGET_COL, ID_COL,
 )
+import hashlib, inspect, os, gc
+
+FEATURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "features")
+SPLITS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "splits")
+
+def split_lockbox(df, fraction=0.15, seed=99):
+    from sklearn.model_selection import train_test_split
+    os.makedirs(SPLITS_DIR, exist_ok=True)
+    dh = hashlib.md5(pd.util.hash_pandas_object(df[[ID_COL, TARGET_COL]]).values.tobytes()).hexdigest()[:8]
+    lp = os.path.join(SPLITS_DIR, f"lockbox_indices_{dh}.npy")
+    if os.path.exists(lp):
+        li = np.load(lp); ci = np.setdiff1d(np.arange(len(df)), li)
+    else:
+        ci, li = train_test_split(np.arange(len(df)), test_size=fraction, random_state=seed, stratify=df[TARGET_COL].values)
+        np.save(lp, li)
+    return df.iloc[ci].reset_index(drop=True), df.iloc[li].reset_index(drop=True)
+
+def get_or_compute_features(compute_fn, *args):
+    os.makedirs(FEATURES_DIR, exist_ok=True)
+    sh = hashlib.md5(inspect.getsource(compute_fn).encode()).hexdigest()[:8]
+    fp = hashlib.md5("|".join(f"{a.shape[0]}x{a.shape[1]}" for a in args if isinstance(a, pd.DataFrame)).encode()).hexdigest()[:6]
+    cp = os.path.join(FEATURES_DIR, f"{compute_fn.__name__}_{sh}_{fp}.parquet")
+    if os.path.exists(cp):
+        return pd.read_parquet(cp)
+    r = compute_fn(*args); r.to_parquet(cp, index=False); return r
 
 
 def compute_bureau_features(train_df, test_df):
@@ -509,6 +533,15 @@ def build_features(train_df, test_df):
         # Region mismatch score
         mismatch_cols = [c for c in df.columns if "diff_from" in c]
         df["region_mismatch_count"] = df[mismatch_cols].sum(axis=1)
+        # Credit bureau inquiry features
+        inq_cols = [c for c in df.columns if c.startswith("amount_req_credit_bureau_")]
+        if inq_cols:
+            df["total_inquiries"] = df[inq_cols].sum(axis=1)
+        # Social circle default rates
+        if "observation_30_cnt_social_circle" in df.columns:
+            df["social_default_rate_30"] = df["default_30_cnt_social_circle"] / df["observation_30_cnt_social_circle"].replace(0, np.nan)
+        if "observation_60_cnt_social_circle" in df.columns:
+            df["social_default_rate_60"] = df["default_60_cnt_social_circle"] / df["observation_60_cnt_social_circle"].replace(0, np.nan)
 
     # Smoothed mean target encoding for high-cardinality categoricals
     # Using global mean as prior with smoothing factor
@@ -533,110 +566,164 @@ def build_features(train_df, test_df):
         X[col] = le.transform(X[col].astype(str))
         X_test[col] = le.transform(X_test[col].astype(str))
 
+    X["_case_id"] = train_df[ID_COL].values
+    X_test["_case_id"] = test_df[ID_COL].values
     return X, y, X_test, test_ids
 
 
 def train_fn(X_train, y_train, X_val, X_test):
-    """Train LightGBM + XGBoost blend. Returns (val_preds, test_preds)."""
+    """Diverse ensemble with meta-model features, seed averaging, and extra models."""
     from sklearn.neighbors import NearestNeighbors
     from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import StratifiedKFold as InnerKFold
 
-    # KNN target mean features (computed within fold to avoid leakage)
+    # Extract case_ids
+    train_ids = X_train["_case_id"].values.copy()
+    val_ids = X_val["_case_id"].values.copy()
+    test_ids_fn = X_test["_case_id"].values.copy()
+    X_train = X_train.drop(columns=["_case_id"])
+    X_val = X_val.drop(columns=["_case_id"])
+    X_test = X_test.drop(columns=["_case_id"])
+
+    # KNN target mean features
     knn_cols = ["ext_source_mean", "credit_annuity_ratio"]
     knn_cols_avail = [c for c in knn_cols if c in X_train.columns]
     if len(knn_cols_avail) >= 2:
         imp = SimpleImputer(strategy="median")
-        X_knn_train = imp.fit_transform(X_train[knn_cols_avail])
-        X_knn_val = imp.transform(X_val[knn_cols_avail])
-        X_knn_test = imp.transform(X_test[knn_cols_avail])
+        Xk_tr = imp.fit_transform(X_train[knn_cols_avail])
+        Xk_va = imp.transform(X_val[knn_cols_avail])
+        Xk_te = imp.transform(X_test[knn_cols_avail])
+        k = 200; nn = NearestNeighbors(n_neighbors=k, algorithm="ball_tree", n_jobs=-1)
+        nn.fit(Xk_tr); y_arr = y_train.values
+        _, vi = nn.kneighbors(Xk_va)
+        X_val = X_val.copy(); X_val["knn_target_mean"] = np.array([y_arr[i].mean() for i in vi])
+        _, ti = nn.kneighbors(Xk_te)
+        X_test = X_test.copy(); X_test["knn_target_mean"] = np.array([y_arr[i].mean() for i in ti])
+        nn2 = NearestNeighbors(n_neighbors=k+1, algorithm="ball_tree", n_jobs=-1)
+        nn2.fit(Xk_tr); _, tri = nn2.kneighbors(Xk_tr)
+        X_train = X_train.copy(); X_train["knn_target_mean"] = np.array([y_arr[i[1:]].mean() for i in tri])
+        del nn, nn2, Xk_tr, Xk_va, Xk_te
 
-        k = 200
-        nn = NearestNeighbors(n_neighbors=k, algorithm="ball_tree", n_jobs=-1)
-        nn.fit(X_knn_train)
-        y_arr = y_train.values
+    # Meta-model features from previous applications
+    prev = load_auxiliary("historical_applications.parquet")
+    mc = [c for c in ["amount_credit","amount_annuity_payment","amount_application","days_decision",
+          "count_payment","amount_down_payment","rate_down_payment","amount_goods_price",
+          "hour_application_start","sellerplace_area"] if c in prev.columns]
+    tmap = pd.Series(y_train.values, index=train_ids)
+    mp = {"objective":"binary","metric":"auc","num_leaves":16,"learning_rate":0.05,
+          "feature_fraction":0.5,"bagging_fraction":0.8,"bagging_freq":5,
+          "min_child_samples":50,"verbose":-1,"seed":42,"n_jobs":-1}
+    # Inner 3-fold CV for train meta-preds
+    ikf = InnerKFold(n_splits=3, shuffle=True, random_state=99)
+    tcd = pd.DataFrame({"_id":train_ids,"_t":y_train.values}).drop_duplicates(subset=["_id"])
+    recs = []
+    for itr, iva in ikf.split(tcd, tcd["_t"]):
+        itr_ids = set(tcd.iloc[itr]["_id"].values)
+        iva_ids = set(tcd.iloc[iva]["_id"].values)
+        ip = prev[prev[ID_COL].isin(itr_ids)].copy()
+        ip["_t"] = ip[ID_COL].map(tmap); ip = ip.dropna(subset=["_t"])
+        mm = lgb.train(mp, lgb.Dataset(ip[mc].fillna(-999),label=ip["_t"]),
+                       num_boost_round=200, callbacks=[lgb.log_evaluation(period=0)])
+        ivp = prev[prev[ID_COL].isin(iva_ids)]
+        if len(ivp)>0:
+            t=ivp[[ID_COL]].copy(); t["p"]=mm.predict(ivp[mc].fillna(-999))
+            a=t.groupby(ID_COL)["p"].agg(["mean","max","std"]).reset_index()
+            a.columns=[ID_COL,"pm","px","ps"]; recs.append(a)
+        del ip, mm; gc.collect()
+    tmdf = pd.concat(recs,ignore_index=True)
+    # Full meta-model for val/test
+    fp = prev[prev[ID_COL].isin(set(train_ids))].copy()
+    fp["_t"]=fp[ID_COL].map(tmap); fp=fp.dropna(subset=["_t"])
+    fm = lgb.train(mp, lgb.Dataset(fp[mc].fillna(-999),label=fp["_t"]),
+                   num_boost_round=200, callbacks=[lgb.log_evaluation(period=0)])
+    pt=prev[[ID_COL]].copy(); pt["p"]=fm.predict(prev[mc].fillna(-999))
+    amag=pt.groupby(ID_COL)["p"].agg(["mean","max","std"]).reset_index()
+    amag.columns=[ID_COL,"pm","px","ps"]
+    del fp, fm, prev, pt; gc.collect()
+    # Add meta-features
+    mn=["prev_meta_mean","prev_meta_max","prev_meta_std"]
+    X_train=X_train.copy()
+    tm=pd.DataFrame({ID_COL:train_ids}).merge(tmdf.rename(columns={"pm":mn[0],"px":mn[1],"ps":mn[2]}),on=ID_COL,how="left")
+    for c in mn: X_train[c]=tm[c].values
+    X_val=X_val.copy()
+    vm=pd.DataFrame({ID_COL:val_ids}).merge(amag.rename(columns={"pm":mn[0],"px":mn[1],"ps":mn[2]}),on=ID_COL,how="left")
+    for c in mn: X_val[c]=vm[c].values
+    X_test=X_test.copy()
+    tsm=pd.DataFrame({ID_COL:test_ids_fn}).merge(amag.rename(columns={"pm":mn[0],"px":mn[1],"ps":mn[2]}),on=ID_COL,how="left")
+    for c in mn: X_test[c]=tsm[c].values
+    del tmdf, amag; gc.collect()
 
-        _, val_idx = nn.kneighbors(X_knn_val)
-        X_val = X_val.copy()
-        X_val["knn_target_mean"] = np.array([y_arr[idx].mean() for idx in val_idx])
-
-        _, test_idx = nn.kneighbors(X_knn_test)
-        X_test = X_test.copy()
-        X_test["knn_target_mean"] = np.array([y_arr[idx].mean() for idx in test_idx])
-
-        nn_self = NearestNeighbors(n_neighbors=k+1, algorithm="ball_tree", n_jobs=-1)
-        nn_self.fit(X_knn_train)
-        _, train_idx = nn_self.kneighbors(X_knn_train)
-        X_train = X_train.copy()
-        X_train["knn_target_mean"] = np.array([y_arr[idx[1:]].mean() for idx in train_idx])
-
-    # LightGBM model 1 — original deep config
-    lgb_params1 = {
-        "objective": "binary", "metric": "auc", "boosting_type": "gbdt",
-        "learning_rate": 0.02, "num_leaves": 63, "max_depth": -1,
-        "min_child_samples": 30, "feature_fraction": 0.7, "bagging_fraction": 0.7,
-        "bagging_freq": 5, "reg_alpha": 0.1, "reg_lambda": 1.0,
-        "min_gain_to_split": 0.01, "verbose": -1, "seed": 42, "n_jobs": -1,
-    }
+    # === Diverse ensemble: 7 model types, LGB seed-averaged ===
     dtrain = lgb.Dataset(X_train, label=y_train)
-    lgb1 = lgb.train(lgb_params1, dtrain, num_boost_round=2000,
-                     callbacks=[lgb.log_evaluation(period=0)])
-    lgb1_val = lgb1.predict(X_val)
-    lgb1_test = lgb1.predict(X_test)
+    all_val, all_test, weights = [], [], []
 
-    # LightGBM model 2 — shallow config from top Kaggle solution (depth=5, feat_frac=0.3)
-    lgb_params2 = {
-        "objective": "binary", "metric": "auc", "boosting_type": "gbdt",
-        "learning_rate": 0.02, "max_depth": 5, "num_leaves": 31,
-        "min_child_samples": 50, "feature_fraction": 0.3, "bagging_fraction": 0.8,
-        "bagging_freq": 5, "reg_alpha": 0.5, "reg_lambda": 5.0,
-        "verbose": -1, "seed": 77, "n_jobs": -1,
-    }
-    lgb2 = lgb.train(lgb_params2, dtrain, num_boost_round=3000,
-                     callbacks=[lgb.log_evaluation(period=0)])
-    lgb2_val = lgb2.predict(X_val)
-    lgb2_test = lgb2.predict(X_test)
+    # LGB deep: 3 seeds averaged (weight 0.20)
+    vv, tt = [], []
+    for s in [42, 123, 456]:
+        m = lgb.train({"objective":"binary","metric":"auc","boosting_type":"gbdt",
+            "learning_rate":0.02,"num_leaves":63,"max_depth":-1,"min_child_samples":30,
+            "feature_fraction":0.7,"bagging_fraction":0.7,"bagging_freq":5,
+            "reg_alpha":0.1,"reg_lambda":1.0,"min_gain_to_split":0.01,
+            "verbose":-1,"seed":s,"n_jobs":-1}, dtrain, num_boost_round=2000,
+            callbacks=[lgb.log_evaluation(period=0)])
+        vv.append(m.predict(X_val)); tt.append(m.predict(X_test)); del m
+    all_val.append(np.mean(vv,axis=0)); all_test.append(np.mean(tt,axis=0)); weights.append(0.20)
 
-    lgb_val = 0.6 * lgb1_val + 0.4 * lgb2_val
-    lgb_test = 0.6 * lgb1_test + 0.4 * lgb2_test
+    # LGB shallow: 3 seeds averaged (weight 0.15)
+    vv, tt = [], []
+    for s in [77, 234, 567]:
+        m = lgb.train({"objective":"binary","metric":"auc","boosting_type":"gbdt",
+            "learning_rate":0.02,"max_depth":5,"num_leaves":31,"min_child_samples":50,
+            "feature_fraction":0.3,"bagging_fraction":0.8,"bagging_freq":5,
+            "reg_alpha":0.5,"reg_lambda":5.0,"verbose":-1,"seed":s,"n_jobs":-1},
+            dtrain, num_boost_round=3000, callbacks=[lgb.log_evaluation(period=0)])
+        vv.append(m.predict(X_val)); tt.append(m.predict(X_test)); del m
+    all_val.append(np.mean(vv,axis=0)); all_test.append(np.mean(tt,axis=0)); weights.append(0.15)
 
-    # XGBoost
-    xgb_params = {
-        "objective": "binary:logistic",
-        "eval_metric": "auc",
-        "learning_rate": 0.02,
-        "max_depth": 6,
-        "min_child_weight": 30,
-        "subsample": 0.7,
-        "colsample_bytree": 0.7,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "seed": 42,
-        "nthread": -1,
-        "verbosity": 0,
-    }
+    # LGB very shallow + GOSS (weight 0.10 + 0.05)
+    m = lgb.train({"objective":"binary","metric":"auc","boosting_type":"gbdt",
+        "learning_rate":0.03,"max_depth":3,"num_leaves":8,"min_child_samples":100,
+        "feature_fraction":0.4,"bagging_fraction":0.7,"bagging_freq":5,
+        "reg_alpha":1.0,"reg_lambda":5.0,"verbose":-1,"seed":555,"n_jobs":-1},
+        dtrain, num_boost_round=4000, callbacks=[lgb.log_evaluation(period=0)])
+    all_val.append(m.predict(X_val)); all_test.append(m.predict(X_test)); del m; weights.append(0.05)
+
+    m = lgb.train({"objective":"binary","metric":"auc","boosting_type":"goss",
+        "learning_rate":0.02,"num_leaves":63,"max_depth":-1,"min_child_samples":30,
+        "feature_fraction":0.7,"reg_alpha":0.1,"reg_lambda":1.0,
+        "verbose":-1,"seed":99,"n_jobs":-1},
+        dtrain, num_boost_round=2000, callbacks=[lgb.log_evaluation(period=0)])
+    all_val.append(m.predict(X_val)); all_test.append(m.predict(X_test)); del m; weights.append(0.10)
+    del dtrain; gc.collect()
+
+    # XGB: 2 seeds averaged (weight 0.25)
     dxtr = xgb.DMatrix(X_train, label=y_train)
-    xgb_model = xgb.train(xgb_params, dxtr, num_boost_round=2000)
-    xgb_val = xgb_model.predict(xgb.DMatrix(X_val))
-    xgb_test = xgb_model.predict(xgb.DMatrix(X_test))
+    vv, tt = [], []
+    for s in [42, 123]:
+        m = xgb.train({"objective":"binary:logistic","eval_metric":"auc",
+            "learning_rate":0.02,"max_depth":6,"min_child_weight":30,
+            "subsample":0.7,"colsample_bytree":0.7,"reg_alpha":0.1,
+            "reg_lambda":1.0,"seed":s,"nthread":-1,"verbosity":0},
+            dxtr, num_boost_round=2000)
+        vv.append(m.predict(xgb.DMatrix(X_val))); tt.append(m.predict(xgb.DMatrix(X_test))); del m
+    all_val.append(np.mean(vv,axis=0)); all_test.append(np.mean(tt,axis=0)); weights.append(0.25)
+    del dxtr; gc.collect()
 
-    # CatBoost
-    cb_model = CatBoostClassifier(
-        iterations=2000,
-        learning_rate=0.03,
-        depth=6,
-        l2_leaf_reg=3.0,
-        random_seed=42,
-        verbose=0,
-        thread_count=-1,
-    )
-    cb_model.fit(X_train, y_train)
-    cb_val = cb_model.predict_proba(X_val)[:, 1]
-    cb_test = cb_model.predict_proba(X_test)[:, 1]
+    # CatBoost standard + deep (weight 0.15 + 0.10)
+    m = CatBoostClassifier(iterations=2000,learning_rate=0.03,depth=6,
+        l2_leaf_reg=3.0,random_seed=42,verbose=0,thread_count=-1)
+    m.fit(X_train,y_train)
+    all_val.append(m.predict_proba(X_val)[:,1]); all_test.append(m.predict_proba(X_test)[:,1])
+    del m; gc.collect(); weights.append(0.15)
 
-    # Blend: 50% LGB + 25% XGB + 25% CatBoost
-    val_preds = 0.50 * lgb_val + 0.25 * xgb_val + 0.25 * cb_val
-    test_preds = 0.50 * lgb_test + 0.25 * xgb_test + 0.25 * cb_test
+    m = CatBoostClassifier(iterations=1500,learning_rate=0.02,depth=8,
+        l2_leaf_reg=5.0,random_seed=99,verbose=0,thread_count=-1)
+    m.fit(X_train,y_train)
+    all_val.append(m.predict_proba(X_val)[:,1]); all_test.append(m.predict_proba(X_test)[:,1])
+    del m; gc.collect(); weights.append(0.10)
 
+    val_preds = sum(w*v for w,v in zip(weights, all_val))
+    test_preds = sum(w*t for w,t in zip(weights, all_test))
     return val_preds, test_preds
 
 
@@ -655,14 +742,13 @@ def main():
     generate_submission(test_ids, results["test_preds"])
 
     elapsed = time.time() - start_time
+    fa = results["fold_aucs"]
+    n_feat = X.shape[1] - (1 if "_case_id" in X.columns else 0)
     print(f"\nval_auc: {results['oof_auc']:.6f}")
     print(f"val_auc_std: {results['std_fold_auc']:.6f}")
-    print(f"n_features: {X.shape[1]}")
-    print(f"pr_auc: {results['oof_pr_auc']:.6f}")
-    print(f"logloss: {results['oof_logloss']:.6f}")
-    print(f"ks: {results['oof_ks']:.6f}")
-    print(f"fold_auc_min: {results['fold_auc_min']:.6f}")
-    print(f"fold_auc_max: {results['fold_auc_max']:.6f}")
+    print(f"n_features: {n_feat}")
+    print(f"fold_auc_min: {min(fa):.6f}")
+    print(f"fold_auc_max: {max(fa):.6f}")
     print(f"elapsed_seconds: {elapsed:.1f}")
 
 
