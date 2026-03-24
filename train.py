@@ -685,6 +685,62 @@ def train_fn(X_train, y_train, X_val, X_test):
          "days_past_due","days_past_due_tolerance"],
         "meta_pos", nrounds=200)
 
+    # 5. Card monthly meta-model
+    build_meta_features("historical_card_monthly.parquet",
+        ["months_relative","amount_balance","amount_credit_limit_actual",
+         "amount_drawings_atm_current","amount_drawings_current",
+         "amount_payment_current","amount_payment_total_current",
+         "amount_receivable_principal","amount_total_receivable",
+         "count_drawings_atm_current","count_drawings_current",
+         "days_past_due","days_past_due_tolerance"],
+        "meta_card", nrounds=200)
+
+    # 6. Bureau monthly meta-model (status → DPD risk)
+    try:
+        bm = load_auxiliary("external_credit_registry_monthly.parquet")
+        # Join to case_id via bureau table
+        bureau = load_auxiliary("external_credit_registry.parquet")
+        rec2case = bureau[[ID_COL,"external_record_id"]].drop_duplicates()
+        bm = bm.merge(rec2case, on="external_record_id", how="left")
+        dpd_map = {"C":0,"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"X":0}
+        bm["dpd_level"] = bm["status"].map(dpd_map).fillna(0).astype(np.int8)
+        bm["is_dpd"] = (bm["dpd_level"] > 0).astype(np.int8)
+        # Build features at case_id level for meta-model
+        bm_cols = ["months_relative","dpd_level","is_dpd"]
+        bm_recs = []
+        for itr, iva in ikf.split(tcd, tcd["_t"]):
+            itr_ids = set(tcd.iloc[itr]["_id"].values)
+            iva_ids = set(tcd.iloc[iva]["_id"].values)
+            ip = bm[bm[ID_COL].isin(itr_ids)].copy()
+            ip["_t"] = ip[ID_COL].map(tmap); ip = ip.dropna(subset=["_t"])
+            if len(ip) < 100: continue
+            mm = lgb.train(mp, lgb.Dataset(ip[bm_cols].fillna(-999), label=ip["_t"]),
+                           num_boost_round=200, callbacks=[lgb.log_evaluation(period=0)])
+            ivp = bm[bm[ID_COL].isin(iva_ids)]
+            if len(ivp) > 0:
+                t = ivp[[ID_COL]].copy(); t["p"] = mm.predict(ivp[bm_cols].fillna(-999))
+                a = t.groupby(ID_COL)["p"].agg(["mean","max","std"]).reset_index()
+                a.columns = [ID_COL,"meta_bm_mean","meta_bm_max","meta_bm_std"]
+                bm_recs.append(a)
+            del ip, mm; gc.collect()
+        if bm_recs:
+            bm_tr = pd.concat(bm_recs, ignore_index=True)
+            fp = bm[bm[ID_COL].isin(train_id_set)].copy()
+            fp["_t"] = fp[ID_COL].map(tmap); fp = fp.dropna(subset=["_t"])
+            fm = lgb.train(mp, lgb.Dataset(fp[bm_cols].fillna(-999), label=fp["_t"]),
+                           num_boost_round=200, callbacks=[lgb.log_evaluation(period=0)])
+            pt = bm[[ID_COL]].copy(); pt["p"] = fm.predict(bm[bm_cols].fillna(-999))
+            bm_full = pt.groupby(ID_COL)["p"].agg(["mean","max","std"]).reset_index()
+            bm_full.columns = [ID_COL,"meta_bm_mean","meta_bm_max","meta_bm_std"]
+            for c in ["meta_bm_mean","meta_bm_max","meta_bm_std"]:
+                X_train[c] = pd.DataFrame({ID_COL:train_ids}).merge(bm_tr,on=ID_COL,how="left")[c].values
+                X_val[c] = pd.DataFrame({ID_COL:val_ids}).merge(bm_full,on=ID_COL,how="left")[c].values
+                X_test[c] = pd.DataFrame({ID_COL:test_ids_fn}).merge(bm_full,on=ID_COL,how="left")[c].values
+            del fp, fm, bm_tr, bm_full
+        del bm, bureau, rec2case; gc.collect()
+    except Exception:
+        pass  # Skip if OOM
+
     gc.collect()
 
     # === Diverse ensemble: 7 model types, LGB seed-averaged ===
