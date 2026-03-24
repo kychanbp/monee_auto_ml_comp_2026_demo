@@ -604,54 +604,88 @@ def train_fn(X_train, y_train, X_val, X_test):
         X_train = X_train.copy(); X_train["knn_target_mean"] = np.array([y_arr[i[1:]].mean() for i in tri])
         del nn, nn2, Xk_tr, Xk_va, Xk_te
 
-    # Meta-model features from previous applications
-    prev = load_auxiliary("historical_applications.parquet")
-    mc = [c for c in ["amount_credit","amount_annuity_payment","amount_application","days_decision",
-          "count_payment","amount_down_payment","rate_down_payment","amount_goods_price",
-          "hour_application_start","sellerplace_area"] if c in prev.columns]
+    # === Multi-table meta-model features (Kaggle winning technique) ===
+    # Train small LGB on each auxiliary table's records to predict target,
+    # then aggregate predictions by case_id. Each table captures different risk dimension.
     tmap = pd.Series(y_train.values, index=train_ids)
-    mp = {"objective":"binary","metric":"auc","num_leaves":16,"learning_rate":0.05,
-          "feature_fraction":0.5,"bagging_fraction":0.8,"bagging_freq":5,
-          "min_child_samples":50,"verbose":-1,"seed":42,"n_jobs":-1}
-    # Inner 3-fold CV for train meta-preds
+    train_id_set = set(train_ids)
+    mp = {"objective":"binary","metric":"auc","num_leaves":32,"learning_rate":0.05,
+          "feature_fraction":0.6,"bagging_fraction":0.8,"bagging_freq":5,
+          "min_child_samples":30,"verbose":-1,"seed":42,"n_jobs":-1}
     ikf = InnerKFold(n_splits=3, shuffle=True, random_state=99)
     tcd = pd.DataFrame({"_id":train_ids,"_t":y_train.values}).drop_duplicates(subset=["_id"])
-    recs = []
-    for itr, iva in ikf.split(tcd, tcd["_t"]):
-        itr_ids = set(tcd.iloc[itr]["_id"].values)
-        iva_ids = set(tcd.iloc[iva]["_id"].values)
-        ip = prev[prev[ID_COL].isin(itr_ids)].copy()
-        ip["_t"] = ip[ID_COL].map(tmap); ip = ip.dropna(subset=["_t"])
-        mm = lgb.train(mp, lgb.Dataset(ip[mc].fillna(-999),label=ip["_t"]),
-                       num_boost_round=200, callbacks=[lgb.log_evaluation(period=0)])
-        ivp = prev[prev[ID_COL].isin(iva_ids)]
-        if len(ivp)>0:
-            t=ivp[[ID_COL]].copy(); t["p"]=mm.predict(ivp[mc].fillna(-999))
-            a=t.groupby(ID_COL)["p"].agg(["mean","max","std"]).reset_index()
-            a.columns=[ID_COL,"pm","px","ps"]; recs.append(a)
-        del ip, mm; gc.collect()
-    tmdf = pd.concat(recs,ignore_index=True)
-    # Full meta-model for val/test
-    fp = prev[prev[ID_COL].isin(set(train_ids))].copy()
-    fp["_t"]=fp[ID_COL].map(tmap); fp=fp.dropna(subset=["_t"])
-    fm = lgb.train(mp, lgb.Dataset(fp[mc].fillna(-999),label=fp["_t"]),
-                   num_boost_round=200, callbacks=[lgb.log_evaluation(period=0)])
-    pt=prev[[ID_COL]].copy(); pt["p"]=fm.predict(prev[mc].fillna(-999))
-    amag=pt.groupby(ID_COL)["p"].agg(["mean","max","std"]).reset_index()
-    amag.columns=[ID_COL,"pm","px","ps"]
-    del fp, fm, prev, pt; gc.collect()
-    # Add meta-features
-    mn=["prev_meta_mean","prev_meta_max","prev_meta_std"]
-    X_train=X_train.copy()
-    tm=pd.DataFrame({ID_COL:train_ids}).merge(tmdf.rename(columns={"pm":mn[0],"px":mn[1],"ps":mn[2]}),on=ID_COL,how="left")
-    for c in mn: X_train[c]=tm[c].values
-    X_val=X_val.copy()
-    vm=pd.DataFrame({ID_COL:val_ids}).merge(amag.rename(columns={"pm":mn[0],"px":mn[1],"ps":mn[2]}),on=ID_COL,how="left")
-    for c in mn: X_val[c]=vm[c].values
-    X_test=X_test.copy()
-    tsm=pd.DataFrame({ID_COL:test_ids_fn}).merge(amag.rename(columns={"pm":mn[0],"px":mn[1],"ps":mn[2]}),on=ID_COL,how="left")
-    for c in mn: X_test[c]=tsm[c].values
-    del tmdf, amag; gc.collect()
+    X_train = X_train.copy(); X_val = X_val.copy(); X_test = X_test.copy()
+
+    def build_meta_features(table_name, num_cols, prefix, join_col=ID_COL, nrounds=300):
+        """Build meta-model features for one auxiliary table."""
+        tbl = load_auxiliary(table_name)
+        cols = [c for c in num_cols if c in tbl.columns]
+        if not cols: return
+        # Inner CV for training fold
+        recs = []
+        for itr, iva in ikf.split(tcd, tcd["_t"]):
+            itr_ids = set(tcd.iloc[itr]["_id"].values)
+            iva_ids = set(tcd.iloc[iva]["_id"].values)
+            ip = tbl[tbl[join_col].isin(itr_ids)].copy()
+            ip["_t"] = ip[join_col].map(tmap); ip = ip.dropna(subset=["_t"])
+            if len(ip) < 100: continue
+            mm = lgb.train(mp, lgb.Dataset(ip[cols].fillna(-999), label=ip["_t"]),
+                           num_boost_round=nrounds, callbacks=[lgb.log_evaluation(period=0)])
+            ivp = tbl[tbl[join_col].isin(iva_ids)]
+            if len(ivp) > 0:
+                t = ivp[[join_col]].copy(); t["p"] = mm.predict(ivp[cols].fillna(-999))
+                a = t.groupby(join_col)["p"].agg(["mean","max","std"]).reset_index()
+                a.columns = [join_col, f"{prefix}_mean", f"{prefix}_max", f"{prefix}_std"]
+                recs.append(a)
+            del ip, mm; gc.collect()
+        if not recs: return
+        tr_df = pd.concat(recs, ignore_index=True)
+        # Full model for val/test
+        fp = tbl[tbl[join_col].isin(train_id_set)].copy()
+        fp["_t"] = fp[join_col].map(tmap); fp = fp.dropna(subset=["_t"])
+        fm = lgb.train(mp, lgb.Dataset(fp[cols].fillna(-999), label=fp["_t"]),
+                       num_boost_round=nrounds, callbacks=[lgb.log_evaluation(period=0)])
+        pt = tbl[[join_col]].copy(); pt["p"] = fm.predict(tbl[cols].fillna(-999))
+        full_agg = pt.groupby(join_col)["p"].agg(["mean","max","std"]).reset_index()
+        full_agg.columns = [join_col, f"{prefix}_mean", f"{prefix}_max", f"{prefix}_std"]
+        del fp, fm, tbl, pt; gc.collect()
+        # Add to X_train, X_val, X_test
+        fnames = [f"{prefix}_mean", f"{prefix}_max", f"{prefix}_std"]
+        tm = pd.DataFrame({join_col: train_ids}).merge(tr_df, on=join_col, how="left")
+        for c in fnames: X_train[c] = tm[c].values
+        vm = pd.DataFrame({join_col: val_ids}).merge(full_agg, on=join_col, how="left")
+        for c in fnames: X_val[c] = vm[c].values
+        tsm = pd.DataFrame({join_col: test_ids_fn}).merge(full_agg, on=join_col, how="left")
+        for c in fnames: X_test[c] = tsm[c].values
+
+    # 1. Previous applications meta-model
+    build_meta_features("historical_applications.parquet",
+        ["amount_credit","amount_annuity_payment","amount_application","days_decision",
+         "count_payment","amount_down_payment","rate_down_payment","amount_goods_price",
+         "hour_application_start","sellerplace_area"],
+        "meta_prev", nrounds=300)
+
+    # 2. Bureau (external credit registry) meta-model
+    build_meta_features("external_credit_registry.parquet",
+        ["days_since_credit_opened","days_credit_overdue","days_until_credit_end",
+         "amount_credit_max_overdue","count_credit_extension","amount_credit_sum",
+         "amount_credit_sum_debt","amount_credit_sum_limit","amount_credit_sum_overdue",
+         "amount_annuity_payment","days_credit_update"],
+        "meta_bureau", nrounds=300)
+
+    # 3. Installment payments meta-model
+    build_meta_features("historical_installment_payments.parquet",
+        ["number_installment_number","days_installment","days_entry_payment",
+         "amount_installment","amount_payment"],
+        "meta_inst", nrounds=200)
+
+    # 4. POS cash monthly meta-model
+    build_meta_features("historical_pos_cash_monthly.parquet",
+        ["months_relative","count_installment","count_installment_future",
+         "days_past_due","days_past_due_tolerance"],
+        "meta_pos", nrounds=200)
+
+    gc.collect()
 
     # === Diverse ensemble: 7 model types, LGB seed-averaged ===
     dtrain = lgb.Dataset(X_train, label=y_train)
