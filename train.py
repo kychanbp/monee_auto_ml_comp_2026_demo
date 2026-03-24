@@ -543,6 +543,52 @@ def build_features(train_df, test_df):
         if "observation_60_cnt_social_circle" in df.columns:
             df["social_default_rate_60"] = df["default_60_cnt_social_circle"] / df["observation_60_cnt_social_circle"].replace(0, np.nan)
 
+        # === NEW DIVERSE FEATURE CATEGORIES ===
+
+        # 1. Ext source pairwise ratios and differences
+        if "external_source_1" in df.columns and "external_source_2" in df.columns:
+            df["ext_1_div_2"] = df["external_source_1"] / df["external_source_2"].replace(0, np.nan)
+            df["ext_2_div_3"] = df["external_source_2"] / df["external_source_3"].replace(0, np.nan)
+            df["ext_1_minus_3"] = df["external_source_1"] - df["external_source_3"]
+            df["ext_min"] = df[["external_source_1","external_source_2","external_source_3"]].min(axis=1)
+            df["ext_max"] = df[["external_source_1","external_source_2","external_source_3"]].max(axis=1)
+            df["ext_range"] = df["ext_max"] - df["ext_min"]
+
+        # 2. Financial stress indicators
+        df["annuity_credit_ratio"] = df["amount_annuity_payment"] / df["amount_credit"].replace(0, np.nan)
+        df["payment_to_goods_ratio"] = df["amount_annuity_payment"] / df["amount_goods_price"].replace(0, np.nan)
+        df["credit_goods_diff"] = df["amount_credit"] - df["amount_goods_price"]
+        df["income_credit_diff"] = df["amount_income_annual"] - df["amount_credit"]
+        df["income_annuity_left"] = df["amount_income_annual"] - 12 * df["amount_annuity_payment"]
+
+        # 3. Time-based interactions
+        if "days_since_birth" in df.columns:
+            df["years_before_retirement"] = (65 * 365.25 + df["days_since_birth"]) / 365.25
+            df["credit_per_year_age"] = df["amount_credit"] / (df["age_years"].replace(0, np.nan))
+        if "days_since_employment_start" in df.columns:
+            df["income_per_employment_year"] = df["amount_income_annual"] / df["employment_years"].replace(0, np.nan)
+            df["employed_before_id_change"] = df["days_since_employment_start"] - df.get("days_id_publish", 0)
+
+        # 4. Application channel and timing features
+        if "weekday_application_start" in df.columns:
+            df["is_weekend_app"] = (df["weekday_application_start"].isin([5, 6])).astype(int)
+        if "hour_application_start" in df.columns:
+            df["is_night_app"] = ((df["hour_application_start"] < 7) | (df["hour_application_start"] > 21)).astype(int)
+
+        # 5. Inquiry pressure features
+        if "amount_req_credit_bureau_year" in df.columns:
+            yr = df["amount_req_credit_bureau_year"].replace(0, np.nan)
+            qtr = df.get("amount_req_credit_bureau_quarter", pd.Series([0]*len(df)))
+            df["inquiry_acceleration"] = qtr * 4 / yr  # annualized recent vs yearly
+            df["inquiry_per_year_age"] = df.get("total_inquiries", 0) / df["age_years"].replace(0, np.nan)
+
+        # 6. Housing/building anomaly score (from building columns)
+        bldg_cols = [c for c in df.columns if c.startswith("apartments_") or c.startswith("basementarea_")
+                     or c.startswith("commonarea_") or c.startswith("elevators_")]
+        if bldg_cols:
+            df["building_info_count"] = df[bldg_cols].notna().sum(axis=1)
+            df["building_info_mean"] = df[bldg_cols].mean(axis=1)
+
     # Smoothed mean target encoding for high-cardinality categoricals
     # Using global mean as prior with smoothing factor
     global_mean = y.mean()
