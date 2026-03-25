@@ -76,50 +76,90 @@ Before each new experiment, **review `notes.md`**.
 6. Run baseline experiment (unmodified `train.py`)
 7. Record baseline result in `results.csv` and `notes.md`
 
+## Keep Criteria
+
+Robust thresholds to filter noise, scaled to observed variance:
+
+| Condition | Decision |
+|---|---|
+| `delta >= 0.001` | **KEEP** — clear improvement |
+| `delta >= 0.0005` AND 4/5 folds improved | **KEEP** — consistent marginal gain |
+| `delta > 0` but below thresholds | **DISCARD** — likely noise |
+| `delta <= 0` | **DISCARD** |
+| **Simplification exception**: `delta >= -0.0003` AND features reduced by >= 20% | **KEEP** — worthwhile simplification |
+
+**Late Stage**: If progress stalls, consider relaxing thresholds to allow more exploratory keeps.
+
+Lower the marginal keep threshold from 0.0005 to 0.0003 when:
+- 4/5+ folds improve
+- Fold std doesn't increase
+- Secondary metrics (PR AUC, log loss) also improve
+
+### Fold Diagnostics
+
+After computing fold AUCs, compute and record:
+- **Per-fold deltas** vs the previous champion's fold AUCs
+- **Min fold delta** and **max fold delta**
+- **Std of fold deltas**
+
+Flag as **"fragile"** if removing the best fold would flip the keep decision.
+
+## Champion-Challenger Protocol
+
+- **Champion** = the current best commit (highest CV AUC), living on the champion branch
+- Experiments branch off the champion and merge back on success; discards are deleted
+- Only champions produce submissions
+- Track `is_champion` column in results.csv
+
 ## Experiment Loop
 
 ```
-LOOP FOREVER:
+LOOP:
   1. Inspect current state: git log --oneline -5, review current train.py
   2. Review notes.md for past ideas, takeaways, and reusable code snippets
-  3. Think of an improvement idea
-  4. Modify train.py with the idea
-  5. git commit -m "experiment: <short description>"
-  6. Run: python train.py > run.log 2>&1
-  7. Extract: grep "^val_auc:" run.log
-  8. If CRASH: read tail of run.log, attempt fix or log as crash and revert
-  9. Append result to results.csv (DO NOT commit results.csv)
-  10. Append experiment entry to notes.md (include key code snippets)
-  11. If val_auc IMPROVED (higher than current best):
-       → KEEP the commit, update best_auc
-  12. If val_auc EQUAL or WORSE:
-       → git reset --hard HEAD~1 (DISCARD the commit)
-       (the code is preserved in notes.md for future reference)
-  13. GOTO 1
+  3. Think of an improvement idea (Prioritize internal knowledge, but feel free to use web search and external LLM tools for brainstorming)
+  4. Create a disposable experiment branch: git checkout -b exp/<exp_id> champion
+  5. Modify train.py with the idea
+  6. git commit -m "experiment: <short description>"
+  7. Run: python train.py > run.log 2>&1
+  8. Extract: grep "^val_auc:" run.log
+  9. If CRASH: read tail of run.log, attempt fix or log as crash
+  10. Append result to results.csv (DO NOT commit results.csv)
+  11. Append experiment entry to notes.md (include fold deltas and fragility flag)
+  12. Apply keep criteria (see above)
+  13. If KEEP: merge into champion branch, update champion if new best
+  14. If DISCARD: delete experiment branch (git branch -D exp/<exp_id>)
+  15. Return to champion branch
+  16. Check stop criteria — if triggered, generate final summary and halt
+  17. GOTO 1
 ```
 
 ## Rules of Engagement
 
 ### Rules
 1. **Output must include `val_auc: X.XXXXXX`** — this is how results are parsed
-2. **No data leakage** — never use validation/test labels during training
+2. **No data leakage** — never use validation/test labels during training. Respect temporal integrity.
 3. **Simplicity criterion** — a tiny AUC gain that adds massive complexity is not worth keeping. Deletions that maintain performance are valued.
-4. **Timeout** — if `python train.py` produces no result for 12 hours, kill and discard. For shorter runs, use your judgement on whether the experiment is making progress and decide whether to keep waiting or kill early.
+4. **Timeout** — adaptive thresholds:
+   - No new log output for **30 minutes** → kill and discard
+   - Total run exceeds **3x the baseline total runtime** → kill and discard
+   - Absolute ceiling: **4 hours** per experiment
 5. **Time budget** — you have ~14 days total. Budget for 50-100+ experiments.
 6. **One idea per experiment** — isolate changes so you know what worked
 7. **Read run.log, not stdout** — redirect output to avoid flooding context
+8. **Computer resources** — consider memory and CPU constraints when designing experiments. Write efficient code and clean up large objects to avoid OOMs. This machine has 23GB RAM and 14 CPUs. Running multiple experiments in parallel requires careful memory management.
 
 ### Logging Format (results.csv)
 
 Comma-separated, one row per experiment:
 ```
-commit,val_auc,val_auc_std,n_features,status,description,submission_file
+commit,val_auc,val_auc_std,n_features,status,description,submission_file,runtime_s,model_family,pr_auc,logloss,ks,lockbox_auc,is_champion,fold_auc_min,fold_auc_max
 ```
 
 ### Status Values
-- `keep` — val_auc improved, commit retained
-- `discard` — val_auc same or worse, commit reverted
-- `crash` — run failed, commit reverted
+- `keep` — val_auc improved (meets keep criteria), commit retained
+- `discard` — below keep thresholds, experiment branch deleted
+- `crash` — run failed, experiment branch deleted
 
 ## Research
 
@@ -127,7 +167,18 @@ When brainstorming ideas, use web search to find relevant techniques, papers, an
 
 ## Parallelism
 
-Use sub-agents to run multiple experiments in parallel. Make full use of available compute resources to improve efficiency.
+Use sub-agents to run multiple experiments in parallel when possible. Follow parallel isolation rules:
+1. Each worker operates in a disposable experiment branch/worktree
+2. Shared `features/` directory is safe due to atomic writes
+3. Only the main agent merges successful experiments back to champion
+4. **Caution**: Running 2+ experiments in parallel requires ~6-8GB RAM each. With 23GB total, limit to 2 concurrent experiments max.
+
+## Stop Criteria
+
+The agent should stop when any of the following conditions are met:
+1. **Stagnation**: 20 consecutive discards → attempt 3 wildcard experiments → if all fail, stop
+2. **Time budget exhausted**: 14-day total runtime exceeded
+3. **Diminishing returns**: last 50 experiments averaged < 0.0002 improvement per keep
 
 ## NEVER STOP
 
@@ -138,4 +189,7 @@ If something crashes, diagnose it, fix it, and move on.
 
 ## Packages
 
-You may install any packages via `pip install` as needed.
+You may install packages as needed, but:
+1. **Log every new dependency and its exact version** in notes.md
+2. **Pin versions** for any winning/champion experiment
+3. **Never upgrade core libraries** (numpy, pandas, scikit-learn) unless necessary
